@@ -1,0 +1,569 @@
+---
+title: "CRT + SM"
+author: "Josh"
+date: "5/2/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(janitor)
+library(googlesheets4)
+
+d <- read_csv("2020-2021-critical-race-posts-schools-districts.csv")
+
+
+```
+
+```{r}
+gs4_auth()
+found_nces_ids <- read_sheet("https://docs.google.com/spreadsheets/d/10q8jFJbrhm2kYf5HuhJaHxuYZme9307bSK5Af707qBU/edit#gid=840289053") %>% clean_names()
+
+write_csv(found_nces_ids, "found-nces-ids.csv")
+```
+
+```{r}
+# found_nces_ids <- read_csv("found-nces-ids.csv")
+
+found_nces_ids$nces_id <- unlist(found_nces_ids$nces_id)
+
+d_cleaned_names <- d %>% janitor::clean_names()
+
+found_nces_ids <- found_nces_ids %>% 
+    select(new_nces_id = nces_id, remove, url)
+
+d_cleaned_names <- d_cleaned_names %>% 
+    left_join(found_nces_ids, by = "url")
+
+d_cleaned_names <- d_cleaned_names %>% 
+    select(post_created_date, page_name, type, total_interactions:care, message, url, nces_id = new_nces_id, remove, post_id = facebook_id, overperforming = overperforming_score_weighted_likes_1x_shares_1x_comments_1x_love_1x_wow_1x_haha_1x_sad_1x_angry_1x_care_1x, followers_at_posting) %>% 
+    mutate(followers_at_posting = as.integer(followers_at_posting)) %>% 
+    filter(!is.na(nces_id)) %>% 
+    filter(nces_id != "xx") %>% 
+    filter(is.na(remove))
+```
+
+```{r}
+nrc <- get_sentiments(lexicon = "nrc")
+
+dd <- d_cleaned_names %>% 
+    unnest_tokens(word, message) %>% 
+    left_join(nrc)
+
+has_any <- function(x) {
+    ifelse(!is.na(x), 1, 0)
+}
+```
+
+```{r}
+dd$post_created <- lubridate::ymd(dd$post_created_date)
+```
+
+## What proportion of the posts incude what the CRC sentiment dictionary recognizes as emotions?
+
+*Note: our sample has 148 (filtered to not include those withut an NCES ID or those that were clearly irrelevant; was 159) posts that met the eligibility criteria, which was posts from schools or districts that included the words "critical race" in sequence*
+
+```{r}
+dd %>% 
+    count(url, sentiment) %>% 
+    spread(sentiment, n) %>% 
+    mutate_at(2:12, has_any) %>% 
+    summarize_at(2:12, .funs = list(sum)) %>% 
+    gather(key, val) %>% 
+    filter(key != "<NA>") %>% 
+    mutate(prop = val / nrow(dd) * 100) %>% 
+    arrange(desc(prop)) %>% 
+    mutate(prop = round(prop, 3), prop = prop * 100) %>% 
+    knitr::kable()
+```
+
+## In which weeks were posts including one or more emotions posted?
+
+```{r}
+dd %>% 
+    count(url, sentiment, post_created) %>% 
+    mutate(sentiment_binary = has_any(sentiment)) %>% 
+    filter(!is.na(sentiment)) %>% 
+    mutate(day = lubridate::round_date(post_created, "week")) %>% 
+    count(day, sentiment, sentiment_binary) %>% 
+    ggplot(aes(x = day, y = n)) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~sentiment) +
+    theme_bw()
+```
+
+## How many unique schools or districts posted and how many times did they post?
+
+**There seems to be an issue with the first account and possibly others - they were linked from a district or school page, but they are not the pages of the districts or schools themselves -- we can remove these**
+
+```{r}
+d_cleaned_names %>% 
+    count(page_name) %>% 
+    arrange(desc(n)) %>%
+    knitr::kable() 
+```
+
+## Merging with NCES data
+
+```{r}
+d_cleaned_names
+```
+
+```{r}
+district_data <- read_csv("new-district-data.csv", skip = 6) %>% clean_names()
+
+district_data <- district_data %>% select(nces_id = agency_id_nces_assigned_district_latest_available_year, state = state_name_district_2020_21, total_students = total_students_all_grades_excludes_ae_district_2020_21)
+district_data <- distinct(district_data, nces_id, .keep_all = TRUE)
+
+district_data <- district_data %>% mutate(
+    nces_id = str_extract(nces_id, "([0-9]+).*$"),
+    nces_id = str_remove(nces_id, '"')
+)
+
+school_data <- read_csv("nces-info-for-schools.csv", skip = 6) %>% clean_names()
+
+school_data <- school_data %>% select(nces_id = school_id_nces_assigned_public_school_latest_available_year, school_state = state_name_public_school_2020_21, school_total_students = total_students_all_grades_excludes_ae_public_school_2020_21)
+school_data <- distinct(school_data, nces_id, .keep_all = TRUE)
+
+school_data <- school_data %>% mutate(
+    nces_id = str_extract(nces_id, "([0-9]+).*$"),
+    nces_id = str_remove(nces_id, '"')
+)
+```
+
+```{r}
+joined_nces_data <- d_cleaned_names %>% 
+    mutate(nces_id = ifelse(str_length(nces_id) == 6, str_c("0", nces_id),
+                            ifelse(str_length(nces_id) == 11, str_c("0", nces_id), nces_id))) %>% 
+    # for arvada
+    mutate(nces_id = ifelse(nces_id == "560568000309", "5605680", nces_id)) %>% 
+    left_join(district_data, by = "nces_id") %>% 
+    left_join(school_data) %>% 
+    mutate(state_combined = ifelse(is.na(state), school_state, state)) %>% 
+    mutate(n_students_combined = ifelse(is.na(total_students), school_total_students, total_students))
+```
+
+```{r}
+joined_nces_data <- joined_nces_data %>% 
+    select(-remove, -state, -total_students, -school_state, -school_total_students) %>% 
+    arrange(desc(total_interactions))
+
+joined_nces_data %>% 
+    knitr::kable()
+```
+
+## Joining comments
+
+```{r}
+# acn <- read_csv("all-comments-new.csv")
+apn <- read_csv("all-posts-new.csv")
+apn <- apn %>% select(post_id, post_url)
+apo <- read_csv("old-comments-csv.csv")
+
+comments <- apo %>% 
+    left_join(apn)
+```
+
+```{r}
+comments <- comments %>% 
+    mutate(url = str_c(str_split(post_url, "posts") %>% purrr::map(~.[[1]]), "posts", str_split(post_url, "posts") %>% purrr::map(~.[[2]]))) %>% 
+    mutate(url = str_replace(url, "https://facebook.com/", "https://www.facebook.com/")) %>% 
+    select(-post_id)
+
+posts <- joined_nces_data %>% 
+    mutate(url = str_c(url, "/"))
+
+write_csv(posts, "posts-to-analyze.csv")
+
+comments %>% 
+    left_join(joined_nces_data) %>% 
+    select(-post_url) %>%
+    write_csv("comments-to-analyze.csv")
+```
+
+```{r}
+posts
+comments
+```
+
+## map
+
+```{r}
+state_to_plot <- posts %>% 
+    count(state_combined) %>% 
+    arrange(desc(n)) %>% 
+    mutate(state = tolower(state_combined))
+
+library(sf)
+library(maps)
+
+# states <- st_as_sf(map("state", plot = FALSE, fill = TRUE))
+# 
+# st_crs(states) <- "3857"
+
+library(mapproj)
+
+states <- map_data("state")
+
+states = states %>%
+    rename(state = region) %>%
+    left_join(state_to_plot)
+
+usamap <- ggplot(states, aes(x=long, y=lat, group=group, fill = n)) +
+    geom_polygon(colour="black") +
+    scale_fill_continuous("") +
+    theme(text = element_text(family = "Times")) +
+    theme_void() +
+    scale_fill_continuous()
+
+usamap
+
+ggsave("Posts by state.jpeg", width = 8.6, height = 6)
+
+# states %>% 
+#     rename(state = ID) %>% 
+#     left_join(state_to_plot) %>% 
+#     ggplot(aes(fill = n)) +
+#     geom_sf() + 
+#     # coord_map("azequalarea") +
+#     theme_void()
+```
+
+## sentiment analysis
+
+```{r}
+posts_words <- posts %>% 
+    unnest_tokens(word, message) %>% 
+    left_join(nrc)
+
+has_any <- function(x) {
+    ifelse(!is.na(x), 1, 0)
+}
+
+posts_word_count <- posts %>% 
+    unnest_tokens(word, message) %>% 
+    count(url)
+
+posts_by_overperforming <- posts_words %>% 
+    count(url, sentiment) %>% 
+    spread(sentiment, n) %>% 
+    # mutate_at(2:12, has_any) %>% 
+    select(-12) %>% 
+    left_join(select(posts_word_count, url, word_count = n)) %>% 
+    left_join(select(posts, type, url, overperforming, message, total_interactions:care)) %>%
+    arrange(desc(overperforming)) %>% 
+    select(message, type, overperforming, everything()) %>% 
+    mutate_if(is.integer, replace_na, 0)
+```
+
+```{r}
+comments <- mutate(comments, comment_id = 1:nrow(comments))
+
+comments_words <- comments %>% 
+    unnest_tokens(word, comment_text) %>% 
+    left_join(nrc)
+
+comments_word_count <- comments %>% 
+    unnest_tokens(word, comment_text) %>% 
+    count(comment_id)
+
+comments_by_overperforming <- comments_words %>% 
+    count(comment_id, sentiment) %>% 
+    spread(sentiment, n) %>% 
+    # mutate_at(2:12, has_any) %>% 
+    select(-12) %>% 
+    left_join(select(comments, comment_id, comment_text, url)) %>% 
+    left_join(select(comments_word_count, comment_id, word_count = n)) %>% 
+    select(comment_text, url, everything(), -comment_id) %>% 
+    mutate_if(is.integer, replace_na, 0)
+
+comments_by_overperforming %>% 
+    write_csv("comments-by-overperforming.csv")
+```
+
+```{r}
+divide_by_wc <- function(x, wc) {
+    x / wc
+}
+
+posts_by_overperforming <- posts_by_overperforming %>% 
+    mutate_at(vars(anger:trust), divide_by_wc, wc = .$word_count)
+
+comments_mean <- comments_by_overperforming %>% 
+    mutate_at(vars(anger:trust), divide_by_wc, wc = .$word_count) %>% 
+    group_by(url) %>% 
+    summarize_at(vars(anger:word_count), mean)
+
+comments_by_overperforming <- comments_by_overperforming %>% 
+    mutate_at(vars(anger:trust), divide_by_wc, wc = .$word_count)
+
+# comments_mean
+
+posts_with_comments <- posts_by_overperforming %>% 
+    left_join(comments_mean, by = "url") %>% 
+    filter(!is.na(anger.y))
+```
+
+dimensions of data sets to analyze
+
+```{r}
+posts_by_overperforming %>% 
+    dim()
+
+comments_by_overperforming %>% 
+    dim()
+
+posts_with_comments %>% 
+    dim()
+```
+
+```{r}
+posts_with_comments %>% 
+    # distinct(url) %>% 
+    summarize(m_op = mean(overperforming),
+              m_c = mean(comments)) # 2.01, 65
+
+posts_by_overperforming %>% 
+    summarize(m_op = mean(overperforming),
+              m_c = mean(comments)) # -4.11, 37
+```
+
+### RQ1 - sentiment of posts 
+
+#### mean emotions by posts
+
+these are percentages, so 6.70% of posts' words were positive, 6.32% related to trust
+
+```{r}
+posts_by_overperforming %>% 
+    glimpse()
+
+posts_by_overperforming %>% 
+    select(anger:trust) %>% 
+    summarize_all(funs(mean, sd)) %>% 
+    mutate_all(~. * 100) %>% 
+    gather(key, val) %>% 
+    mutate(val = round(val, 2)) %>% 
+    arrange(desc(val)) %>% 
+    separate(key, into = c("var", "stat")) %>% 
+    spread(stat, val) %>% 
+    arrange(desc(mean)) %>% 
+    knitr::kable()
+
+posts_by_overperforming %>% 
+    select(anger:trust) %>% 
+    gather(key, val) %>% 
+    mutate(key = tools::toTitleCase(key)) %>% 
+    ggplot(aes(y = reorder(key, val), x = val, fill = key)) +
+    geom_density_ridges() +
+    theme_bw() +
+    theme(legend.position = "none") +
+    xlab("Proportion of Words in Posts") +
+    ylab("Sentiment Category")
+
+ggsave("ridges-posts.png", width = 7, height = 5.5)
+```
+
+#### mean emotions by posts' correlation w/ overperforming
+
+```{r}
+posts_by_overperforming %>% 
+    select(anger:trust, overperforming) %>% 
+    gather(key, val, -overperforming) %>% 
+    ggplot(aes(y =overperforming, x = val, color = key, group = key)) +
+    geom_point(alpha = .4) +
+    geom_smooth(method = "lm", se = FALSE) +
+    facet_wrap(~key)
+```
+
+plots for variability
+
+```{r}
+posts_by_overperforming %>% 
+    select(anger:trust) %>% 
+    gather(key, val) %>% 
+    ggplot(aes(x = val, fill = key)) +
+    geom_histogram(bins = 75) +
+    facet_wrap(~key, ncol = 3) +
+    theme_bw() +
+    theme(legend.position = "none")
+
+ggsave("posts-sentiment-variability.png", width = 8, height = 8)
+```
+
+
+#### for case study analysis of posts' sentiment
+
+```{r}
+posts_by_overperforming %>% 
+    write_csv("posts-by-overperforming.csv")
+```
+
+### RQ2 - sentiment of comments 
+
+#### mean emotions by comments
+
+these are percentages, so, 1.53 for positive means 1.53 % of the words in comments were positive, .17% (<1%) were anger-related
+
+```{r}
+library(ggridges)
+
+posts_by_overperforming %>% 
+    select(anger:trust) %>% 
+    summarize_all(funs(mean, sd)) %>% 
+    mutate_all(~. * 100) %>% 
+    gather(key, val) %>% 
+    mutate(val = round(val, 2)) %>% 
+    separate(key, into = c("var", "stat")) %>% 
+    spread(stat, val) %>% 
+    arrange(desc(mean))
+
+comments_by_overperforming %>% 
+    select(anger:trust) %>% 
+    gather(key, val) %>% 
+    mutate(key = tools::toTitleCase(key)) %>% 
+    ggplot(aes(y = reorder(key, val), x = val, fill = key)) +
+    geom_density_ridges() +
+    theme_bw() +
+    theme(legend.position = "none") +
+    xlab("Proportion of Words in Comments") +
+    ylab("Sentiment Category")
+
+ggsave("ridges-comments.png", width = 8, height = 8)
+```
+
+plots for variability
+
+```{r}
+comments_by_overperforming %>% 
+    select(-comment_text, -word_count) %>% 
+    # group_by(url) %>% 
+    # summarize_all(funs(mean)) %>% 
+    select(anger:trust) %>% 
+    gather(key, val) %>% 
+    ggplot(aes(x = val, fill = key)) +
+    geom_histogram(bins = 40) +
+    facet_wrap(~key, ncol = 3) +
+    theme_bw() +
+    theme(legend.position = "none")
+
+ggsave("comments-sentiment-variability.png", width = 7, height = 5.5)
+```
+
+### RQ3 - relation of sentiment of posts and comments
+
+```{r}
+library(ggrepel)
+
+posts_with_comments %>% 
+    mutate(my_label = ifelse(comments == 13, "Westfield, MA (overperforming and neutral)",
+                             ifelse(str_detect(url, "504538452950355"), "Springboro, OH (overperforming and negative)", NA))) %>% 
+    mutate(my_color = ifelse(comments == 13, "red",
+                             ifelse(str_detect(url, "504538452950355"), "red", "black"))) %>% 
+    ggplot(aes(y = overperforming, x = negative.y, label = my_label)) +
+    geom_point(aes(color = my_color)) +
+    geom_label_repel(
+        nudge_x = .005,
+        nudge_y = 1,
+        box.padding = 1,
+        alpha = .8
+    ) +
+    ylab("Overperforming Score") +
+    xlab("Negativity of Comments") +
+    theme_bw() +
+    theme(legend.position = "none",
+          text = element_text(size = 14))
+
+ggsave("overperforming-by-negativity.png", width = 8, 
+       height = 7)
+```
+
+these are complex, too; anger.x for instance is the proportion of words in posts that are related to anger; anger.y is mean proportion of words in comments related to anger; here is a scatterplot of their relations
+
+```{r}
+posts_with_comments %>% 
+    select(anger.x:trust.x, anger.y:trust.y) %>% 
+    ggplot(aes(x = fear.x, y = fear.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = anticipation.x, y = anticipation.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = disgust.x, y = disgust.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = fear.x, y = fear.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = joy.x, y = joy.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = negative.x, y = negative.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = positive.x, y = positive.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = sadness.x, y = sadness.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = surprise.x, y = surprise.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+posts_with_comments %>% 
+    ggplot(aes(x = trust.x, y = trust.y)) +
+    geom_point(alpha = .5) +
+    geom_smooth(method = "lm", se = FALSE)
+```
+
+#### for case study analysis of top 5 posts with comments
+
+```{r}
+posts_with_comments %>% 
+    write_csv("posts-with-comments.csv")
+```
+
+```{r}
+
+```
